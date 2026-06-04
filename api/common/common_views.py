@@ -567,21 +567,45 @@ class GTASANDSHOREAPI(APIView):
 
 class UserProfilePicAPI(APIView):
     def get(self, request, muid):
-        user = User.objects.filter(muid=muid).annotate(image=F("profile_pic")).values("image")
-        return CustomResponse(response=user).get_success_response()
+        user = User.objects.filter(muid=muid).first()
+        if user is None:
+            return CustomResponse(general_message='User not found').get_failure_response()
+        
+        return CustomResponse(response={'image': user.profile_pic}).get_success_response()
 
 
 class ListIGAPI(APIView):
 
     def get(self, request):
         return CustomResponse(response=InterestGroup.objects.all().values("name")).get_success_response()
+
+
+class IGDetailAPI(APIView):
+    def get(self, request, pk):
+        from api.dashboard.ig.dash_ig_serializer import InterestGroupSerializer
+
+        ig_data = (
+            InterestGroup.objects.prefetch_related("user_ig_link_ig")
+            .filter(id=pk)
+            .first()
+        )
+
+        if not ig_data:
+            return CustomResponse(
+                general_message="Interest Group Not Found"
+            ).get_failure_response()
+
+        serializer = InterestGroupSerializer(ig_data, many=False)
+        return CustomResponse(
+            response={"interestGroup": serializer.data}
+        ).get_success_response()
 class ListAllLevelInfo(APIView):
     def get(self, request):
 
         levels = Level.objects.all().order_by("level_order")
         response = []
         for level in levels:
-            tasks = TaskList.objects.filter(level=level).select_related("ig", "channel")
+            tasks = TaskList.objects.filter(level=level, active=True).select_related("ig", "channel")
             task_list = []
             for task in tasks:
                 task_list.append({
