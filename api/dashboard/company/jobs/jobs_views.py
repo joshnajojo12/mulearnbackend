@@ -1,8 +1,9 @@
 from pytz import timezone
 from rest_framework.views import APIView
 from rest_framework import status
+from django.db.models import F, Sum
 from db.user import User
-from db.company import Company, CompanyJob,CompanyJobRule
+from db.company import Company, CompanyJob, CompanyJobRule, CompanyJobApplication
 from utils.permission import JWTUtils, CustomizePermission
 from utils.response import CustomResponse
 from utils.utils import CommonUtils
@@ -856,3 +857,127 @@ class PublicJobsListAPIView(APIView):
             response={"jobs": serializer.data, "pagination": paginated_data["pagination"]},
             general_message="Jobs fetched successfully"
         ).get_success_response()
+
+
+class TrackJobViewAPIView(BaseCompanyJobView):
+    """
+    POST /company/jobs/<job_id>/view/
+
+    Increments the view count for a specific job listing.
+    """
+    # Protected by CustomizePermission via BaseCompanyJobView
+
+    def post(self, request, job_id):
+        try:
+            # 1. Get authenticated user
+            user = self.get_authenticated_user(request)
+            if not user:
+                return CustomResponse(
+                    general_message="User not found"
+                ).get_failure_response(
+                    status_code=401,
+                    http_status_code=status.HTTP_401_UNAUTHORIZED
+                )
+
+            # 2. Get the job
+            try:
+                job = CompanyJob.objects.get(id=job_id, is_deleted=False)
+            except CompanyJob.DoesNotExist:
+                return CustomResponse(
+                    general_message="Job does not exist",
+                    message={"error_code": "JOB_NOT_FOUND"}
+                ).get_failure_response(
+                    status_code=404,
+                    http_status_code=status.HTTP_404_NOT_FOUND
+                )
+
+            # 3. Check company authorization
+            authorized, company, error_response = self.check_company_authorization(user, job=job)
+            if not authorized:
+                return error_response
+
+            # 4. Increment total_views using F expression to prevent race conditions
+            job.total_views = F('total_views') + 1
+            job.save(update_fields=['total_views'])
+
+            return CustomResponse(
+                general_message="Job view tracked successfully.",
+                response={}
+            ).get_success_response()
+
+        except Exception as e:
+            print(f"Error tracking job view: {str(e)}")
+            return CustomResponse(
+                general_message="Something went wrong",
+                message={"error_code": "SERVER_ERROR"}
+            ).get_failure_response(
+                status_code=500,
+                http_status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+class CompanyJobEngagementAnalyticsAPIView(BaseCompanyJobView):
+    """
+    GET /company/jobs/<job_id>/analytics/
+
+    Fetches detailed view, application, and hired statistics for a specific job posting.
+    """
+    # Protected by CustomizePermission via BaseCompanyJobView
+
+    def get(self, request, job_id):
+        try:
+            # 1. Get authenticated user
+            user = self.get_authenticated_user(request)
+            if not user:
+                return CustomResponse(
+                    general_message="User not found"
+                ).get_failure_response(
+                    status_code=401,
+                    http_status_code=status.HTTP_401_UNAUTHORIZED
+                )
+
+            # 2. Get the job
+            try:
+                job = CompanyJob.objects.get(id=job_id, is_deleted=False)
+            except CompanyJob.DoesNotExist:
+                return CustomResponse(
+                    general_message="Job does not exist",
+                    message={"error_code": "JOB_NOT_FOUND"}
+                ).get_failure_response(
+                    status_code=404,
+                    http_status_code=status.HTTP_404_NOT_FOUND
+                )
+
+            # 3. Check company authorization
+            authorized, company, error_response = self.check_company_authorization(user, job=job)
+            if not authorized:
+                return error_response
+
+            # 4. Aggregate metrics
+            total_views = job.total_views
+            total_applications = CompanyJobApplication.objects.filter(job=job).count()
+            total_hired = CompanyJobApplication.objects.filter(job=job, status='accepted').count()
+
+            response_data = {
+                "job_id": str(job.id),
+                "job_title": job.title,
+                "total_views": total_views,
+                "total_applications": total_applications,
+                "total_hired": total_hired,
+                "conversion_rate_percentage": round((total_applications / total_views) * 100, 2) if total_views > 0 else 0.0
+            }
+
+            return CustomResponse(
+                response=response_data,
+                general_message="Job analytics fetched successfully"
+            ).get_success_response()
+
+        except Exception as e:
+            print(f"Error fetching job analytics: {str(e)}")
+            return CustomResponse(
+                general_message="Something went wrong",
+                message={"error_code": "SERVER_ERROR"}
+            ).get_failure_response(
+                status_code=500,
+                http_status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )

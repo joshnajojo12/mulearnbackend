@@ -7,6 +7,8 @@ from .jobs_views import (
     UpdateJobRuleAPIView,
     DeleteJobRuleAPIView,
     GetCompanyJobDetailsAPIView,
+    TrackJobViewAPIView,
+    CompanyJobEngagementAnalyticsAPIView,
 )
 from .application_views import (
     ApplyToJobAPIView,
@@ -18,6 +20,8 @@ urlpatterns = [
     path('', ListCompanyJobsAPIView.as_view(), name='list-company-jobs'),
     path('create/', CreateCompanyJobAPIView.as_view(), name='create-company-job'),
     path('<str:job_id>/details/', GetCompanyJobDetailsAPIView.as_view(), name='get-company-job-details'),
+    path('<str:job_id>/view/', TrackJobViewAPIView.as_view(), name='track-job-view'),
+    path('<str:job_id>/analytics/', CompanyJobEngagementAnalyticsAPIView.as_view(), name='company-job-analytics'),
     path('<str:job_id>/', UpdateCompanyJobAPIView.as_view(), name='update-company-job'),
     path('<str:job_id>/rules/create/', CreateJobRuleAPIView.as_view(), name='create-company-job-rule'),
     path('<str:job_id>/rules/<str:rule_id>/', UpdateJobRuleAPIView.as_view(), name='update-job-rule'),

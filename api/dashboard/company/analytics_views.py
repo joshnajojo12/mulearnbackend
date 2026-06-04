@@ -137,9 +137,11 @@ class CompanyDashboardSummaryAPIView(APIView):
         period_jobs = jobs.filter(created_at__gte=since) if since else jobs
         period_apps = apps.filter(created_at__gte=since) if since else apps
 
+        total_views = jobs.aggregate(total=Sum('total_views'))['total'] or 0
+
         quick_stats = {
             "jobs_posted": jobs.count(),
-            "total_views": 0,
+            "total_views": total_views,
             "applications": apps.count(),
             "hired": apps.filter(status="accepted").count(),
         }
@@ -157,7 +159,7 @@ class CompanyDashboardSummaryAPIView(APIView):
                 "quick_stats": quick_stats,
                 "stat_cards": [
                     {"key": "jobs_posted", "label": "Jobs posted", "value": quick_stats["jobs_posted"], "delta": period_jobs.count(), "delta_type": "increase", "period": request.query_params.get("period", "30d")},
-                    {"key": "total_views", "label": "Total views", "value": quick_stats["total_views"], "delta": 0, "delta_type": "neutral", "period": request.query_params.get("period", "30d")},
+                    {"key": "total_views", "label": "Total views", "value": quick_stats["total_views"], "delta": total_views, "delta_type": "increase" if total_views > 0 else "neutral", "period": request.query_params.get("period", "30d")},
                     {"key": "applications", "label": "Applications", "value": quick_stats["applications"], "delta": period_apps.count(), "delta_type": "increase", "period": request.query_params.get("period", "30d")},
                     {"key": "hired", "label": "Hired", "value": quick_stats["hired"], "delta": period_apps.filter(status="accepted").count(), "delta_type": "increase", "period": request.query_params.get("period", "30d")},
                 ],
