@@ -58,10 +58,18 @@ class CommonUtils:
         if sort_by:
             sort = sort_by[1:] if sort_by.startswith("-") else sort_by
             if sort_field_name := sort_fields.get(sort):
-                if sort_by.startswith("-"):
-                    sort_field_name = f"-{sort_field_name}"
+                if isinstance(sort_field_name, (tuple, list)):
+                    if sort_by.startswith("-"):
+                        sort_field_name = [
+                            f"-{f}" if not f.startswith("-") else f[1:]
+                            for f in sort_field_name
+                        ]
+                    queryset = queryset.order_by(*sort_field_name)
+                else:
+                    if sort_by.startswith("-"):
+                        sort_field_name = f"-{sort_field_name}"
 
-                queryset = queryset.order_by(sort_field_name)
+                    queryset = queryset.order_by(sort_field_name)
         if is_pagination:
             paginator = Paginator(queryset, per_page)
             try:
