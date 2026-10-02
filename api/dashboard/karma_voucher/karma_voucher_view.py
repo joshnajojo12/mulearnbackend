@@ -127,35 +127,37 @@ class ImportVoucherLogAPI(APIView):
                     count += 1
                     valid_rows.append(row)
 
-        # Serializing and saving valid voucher rows to the database
+        # Strip muid/hashtag (not serializer fields) so the strict-serializer patch doesn't reject them.
         voucher_serializer = VoucherLogCSVSerializer(
-            data=valid_rows, many=True)
+            data=[
+                {k: v for k, v in row.items() if k not in ('muid', 'hashtag')}
+                for row in valid_rows
+            ],
+            many=True)
         with transaction.atomic():
             if voucher_serializer.is_valid():
                 voucher_serializer.save()
             else:
-                code_error_dict = {}
-                for error in voucher_serializer.errors:
-                    code_error = error.get('code')
-                    error_msg = error.get('error')
-
-                    code = str(code_error[0])
-                    error_value = str(error_msg[0])
-                    code_error_dict[code] = error_value
-
-                for row in valid_rows:
-                    code = row['code']
-                    error_row = {}
-                    if code in code_error_dict:
-                        error_row['muid'] = row['muid']
-                        error_row['karma'] = row['karma']
-                        error_row['week'] = row['week']
-                        error_row['month'] = row['month']
-                        error_row['hashtag'] = row['hashtag']
-                        error_row['description'] = row['description']
-                        error_row['event'] = row['event']
-                        error_row['error'] = code_error_dict[code]
-                        error_rows.append(error_row)
+                for row, error in zip(valid_rows, voucher_serializer.errors):
+                    if not error:
+                        continue
+                    if 'code' in error and 'error' in error:
+                        error_value = str(error['error'][0])
+                    else:
+                        # Standard DRF field-level errors, e.g.
+                        # {'karma': ['A valid integer is required.']}
+                        field, messages = next(iter(error.items()))
+                        error_value = f"{field}: {messages[0]}"
+                    error_rows.append({
+                        'muid': row['muid'],
+                        'karma': row['karma'],
+                        'week': row['week'],
+                        'month': row['month'],
+                        'hashtag': row['hashtag'],
+                        'description': row['description'],
+                        'event': row['event'],
+                        'error': error_value,
+                    })
 
                 return CustomResponse(
                     general_message='Fix the errors and try again ',
@@ -244,7 +246,8 @@ class VoucherLogAPI(APIView):
         responses={200: VoucherLogSerializer},
     )
     def get(self, request):
-        voucher_queryset = VoucherLog.objects.all()
+        voucher_queryset = VoucherLog.objects.select_related(
+            'user', 'task', 'created_by', 'updated_by')
         paginated_queryset = CommonUtils.get_paginated_queryset(
             voucher_queryset, request,
             search_fields=["user__full_name",
@@ -284,27 +287,22 @@ class VoucherLogAPI(APIView):
             data=request.data, context={'request': request})
         if serializer.is_valid():
             with transaction.atomic():
-                id = serializer.save().id
-                voucher = VoucherLog.objects.filter(id=id).values(
-                    'code',
-                    'user__full_name',
-                    'user__email',
-                    'task__hashtag',
-                    'month',
-                    'week',
-                    'karma'
-                ).first()
-                if not voucher:
+                voucher_id = serializer.save().id
+                voucher_obj = VoucherLog.objects.select_related(
+                    'user', 'task', 'created_by', 'updated_by'
+                ).filter(id=voucher_id).first()
+                if not voucher_obj:
                     transaction.set_rollback(True)
                     return CustomResponse(
                         general_message='Something went wrong. Please try again.').get_failure_response()
-            code = voucher['code']
-            month = voucher['month']
-            week = voucher['week']
-            karma = voucher['karma']
-            task_hashtag = voucher['task__hashtag']
-            full_name = voucher['user__full_name']
-            email = voucher['user__email']
+            voucher_data = VoucherLogSerializer(voucher_obj).data
+            code = voucher_data['code']
+            month = voucher_data['month']
+            week = voucher_data['week']
+            karma = voucher_data['karma']
+            task_hashtag = voucher_obj.task.hashtag
+            full_name = voucher_obj.user.full_name
+            email = voucher_obj.user.email
 
             # Preparing email context and attachment
             from_mail = decouple.config("FROM_MAIL")
@@ -343,14 +341,15 @@ class VoucherLogAPI(APIView):
             except Exception as e:
                 print(f"Failed to send email to {email}: {str(e)}")
             return CustomResponse(general_message='Voucher created successfully',
-                                  response=serializer.data).get_success_response()
+                                  response=voucher_data).get_success_response()
         return CustomResponse(message=serializer.errors).get_failure_response()
 
     @role_required([RoleType.ADMIN.value, RoleType.FELLOW.value, RoleType.ASSOCIATE.value])
     @extend_schema(
         tags=['Dashboard - Karma Voucher'],
         description="Partially update Voucher Log.",
-        responses={200: VoucherLogUpdateSerializer},
+        request=VoucherLogUpdateSerializer,
+        responses={200: VoucherLogSerializer},
     )
     def patch(self, request, voucher_id):
         user_id = JWTUtils.fetch_user_id(request)
@@ -363,7 +362,12 @@ class VoucherLogAPI(APIView):
             voucher, data=request.data, context=context)
         if serializer.is_valid():
             serializer.save()
-            return CustomResponse(general_message='Voucher updated successfully').get_success_response()
+            voucher = VoucherLog.objects.select_related(
+                'user', 'task', 'created_by', 'updated_by'
+            ).get(id=voucher_id)
+            voucher_data = VoucherLogSerializer(voucher).data
+            return CustomResponse(general_message='Voucher updated successfully',
+                                  response=voucher_data).get_success_response()
         return CustomResponse(message=serializer.errors).get_failure_response()
 
     @role_required([RoleType.ADMIN.value, RoleType.FELLOW.value, RoleType.ASSOCIATE.value])

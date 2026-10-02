@@ -5,10 +5,11 @@ from rest_framework.views import APIView
 from django.db import transaction
 from db.task import InterestGroup
 from db.user import User, Role
+from db.campus import CampusExecomRole
 from utils.permission import CustomizePermission
 from utils.permission import JWTUtils, role_required
 from utils.response import CustomResponse
-from utils.types import RoleType, WebHookActions, WebHookCategory
+from utils.types import RoleType, WebHookActions, WebHookCategory, InterestGroupStatus
 from utils.utils import CommonUtils, DiscordWebhooks
 from .dash_ig_serializer import (
     InterestGroupSerializer,
@@ -255,7 +256,7 @@ class InterestGroupAPI(APIView):
             data=ig_serializer_data, pagination=paginated_queryset.get("pagination")
         )
 
-    @role_required([RoleType.ADMIN.value])
+    @role_required([RoleType.ADMIN.value, RoleType.IG_LEAD.value])
     @extend_schema(
         tags=['Dashboard - Ig'],
         description=(
@@ -427,11 +428,47 @@ class InterestGroupAPI(APIView):
             ).first()
 
             if ig_campus_lead_role:
-                ig_campus_lead_role.title = ig_new_code + " CampusLead"
+                ig_campus_lead_role.title = RoleType.IG_CAMPUS_LEAD_ROLE(ig_new_code)
                 ig_campus_lead_role.description = (
                     ig_new_name + " Interest Group Campus Lead"
                 )
                 ig_campus_lead_role.save()
+
+            # Co-Lead is a peer role to Campus Lead above and must be renamed the same way —
+            # otherwise its holder is silently orphaned under the old code (see PR history).
+            ig_campus_colead_role = Role.objects.filter(
+                title=RoleType.IG_CAMPUS_COLEAD_ROLE(ig_old_code)
+            ).first()
+
+            if ig_campus_colead_role:
+                ig_campus_colead_role.title = RoleType.IG_CAMPUS_COLEAD_ROLE(ig_new_code)
+                ig_campus_colead_role.description = (
+                    ig_new_name + " Interest Group Campus Co-Lead"
+                )
+                ig_campus_colead_role.save()
+
+            # The campus_execom_role catalog is a separate, decoupled directory (no FK to
+            # `Role`) that also stores these code-derived titles for the campus dashboard's
+            # role picker. Keep it in sync too, or the old-code titles linger there forever
+            # and leak into every campus's assignable-role list as if they were generic roles.
+            for old_title, new_title in (
+                (RoleType.IG_CAMPUS_LEAD_ROLE(ig_old_code), RoleType.IG_CAMPUS_LEAD_ROLE(ig_new_code)),
+                (RoleType.IG_CAMPUS_COLEAD_ROLE(ig_old_code), RoleType.IG_CAMPUS_COLEAD_ROLE(ig_new_code)),
+            ):
+                if old_title == new_title:
+                    continue
+                catalog_row = CampusExecomRole.objects.filter(title__iexact=old_title).first()
+                if catalog_row is None:
+                    continue
+                if CampusExecomRole.objects.filter(title__iexact=new_title).exclude(pk=catalog_row.pk).exists():
+                    # A row for the new-code title already exists (shouldn't normally
+                    # happen) — drop the stale old-code row instead of violating the
+                    # catalog's unique constraint on title.
+                    catalog_row.delete()
+                    continue
+                catalog_row.title = new_title
+                catalog_row.updated_by_id = user_id
+                catalog_row.save()
 
             ig_lead_role = Role.objects.filter(
                 title=RoleType.IG_LEAD_ROLE(ig_old_code)
@@ -456,7 +493,7 @@ class InterestGroupAPI(APIView):
 
         return CustomResponse(message=serializer.errors).get_failure_response()
 
-    @role_required([RoleType.ADMIN.value])
+    @role_required([RoleType.ADMIN.value, RoleType.IG_LEAD.value])
     @extend_schema(tags=['Dashboard - Ig'], description="Delete Interest Group.",
         responses={200: InterestGroupSerializer},
     )
@@ -487,6 +524,54 @@ class InterestGroupAPI(APIView):
         return CustomResponse(
             general_message="ig deleted successfully"
         ).get_success_response()
+
+
+class InterestGroupActivateAPIView(APIView):
+    authentication_classes = [CustomizePermission]
+
+    @role_required([RoleType.ADMIN.value, RoleType.IG_LEAD.value])
+    @extend_schema(
+        tags=['Dashboard - Ig'],
+        description="Activate an Interest Group.",
+        responses={200: InterestGroupSerializer},
+    )
+    def post(self, request, pk):
+        ig = InterestGroup.objects.filter(id=pk).first()
+        if not ig:
+            return CustomResponse(general_message="Interest Group not found").get_failure_response()
+
+        if ig.status == InterestGroupStatus.ACTIVE.value:
+            return CustomResponse(general_message="Interest Group is already active").get_failure_response()
+
+        ig.status = InterestGroupStatus.ACTIVE.value
+        ig.updated_by_id = JWTUtils.fetch_user_id(request)
+        ig.save()
+
+        return CustomResponse(general_message=f"{ig.name} activated").get_success_response()
+
+
+class InterestGroupDeactivateAPIView(APIView):
+    authentication_classes = [CustomizePermission]
+
+    @role_required([RoleType.ADMIN.value, RoleType.IG_LEAD.value])
+    @extend_schema(
+        tags=['Dashboard - Ig'],
+        description="Deactivate an Interest Group.",
+        responses={200: InterestGroupSerializer},
+    )
+    def post(self, request, pk):
+        ig = InterestGroup.objects.filter(id=pk).first()
+        if not ig:
+            return CustomResponse(general_message="Interest Group not found").get_failure_response()
+
+        if ig.status == InterestGroupStatus.INACTIVE.value:
+            return CustomResponse(general_message="Interest Group is already inactive").get_failure_response()
+
+        ig.status = InterestGroupStatus.INACTIVE.value
+        ig.updated_by_id = JWTUtils.fetch_user_id(request)
+        ig.save()
+
+        return CustomResponse(general_message=f"{ig.name} deactivated").get_success_response()
 
 
 class InterestGroupCSV(APIView):
@@ -673,35 +758,21 @@ class InterestGroupGetAPI(APIView):
                     if not target_user:
                         continue
 
-                    # 1. Ensure an approved UserMentor profile exists.
-                    # Never overwrite mentor_tier on an existing profile —
-                    # a Company/Campus mentor gaining IG-mentor authority is
-                    # additive (via the MentorScopeGrant below), not a tier
-                    # replacement.
+                    # 1. Ensure the mentor's single profile row exists. Tier
+                    # membership is never stored here — it's additive via the
+                    # MentorScopeGrant below, so a Company/Campus mentor
+                    # gaining IG-mentor authority never touches any other
+                    # tier's grant.
                     now = DateTimeUtils.get_current_utc_time()
                     mentor_profile, created = UserMentor.objects.get_or_create(
                         user=target_user,
                         defaults={
-                            "status":        UserMentor.Status.APPROVED,
-                            "mentor_tier":   UserMentor.MentorTier.IG_MENTOR,
-                            "verified_by_id": user_id,
-                            "verified_at":   now,
                             "created_by_id": user_id,
                             "updated_by_id": user_id,
                             "created_at":    now,
                             "updated_at":    now,
                         },
                     )
-                    if not created and mentor_profile.status != UserMentor.Status.APPROVED:
-                        mentor_profile.status = UserMentor.Status.APPROVED
-                        mentor_profile.verified_by_id = user_id
-                        mentor_profile.verified_at = now
-                        mentor_profile.updated_by_id = user_id
-                        mentor_profile.updated_at = now
-                        mentor_profile.save(update_fields=[
-                            "status", "verified_by_id", "verified_at",
-                            "updated_by_id", "updated_at",
-                        ])
 
                     # 1b. Grant IG-scoped authority additively.
                     from db.user import MentorScopeGrant
@@ -1036,11 +1107,106 @@ class InterestGroupRequestAPI(APIView):
         ).get_success_response()
 
 
+def get_ig_list_context(ig_queryset):
+    import json
+    from db.user import User, Socials, UserMentor
+    from db.task import UserIgLink
+
+    # 1. Collect all MUIDs from leads and thinktank columns across all IGs
+    all_muids = set()
+    for ig in ig_queryset:
+        for field in ["leads", "thinktank"]:
+            val = getattr(ig, field, None)
+            if isinstance(val, str) and val:
+                try:
+                    parsed = json.loads(val)
+                    if isinstance(parsed, list):
+                        for item in parsed:
+                            if isinstance(item, dict):
+                                muid = item.get("muid")
+                                if muid:
+                                    all_muids.add(muid)
+                except Exception:
+                    pass
+
+    # 2. Batch-fetch users by these MUIDs
+    user_map = {}
+    if all_muids:
+        users = User.objects.filter(muid__in=all_muids)
+        user_map = {u.muid: u for u in users}
+
+    # 3. Collect all user IDs (leads + thinktank users + prefetched mentors)
+    all_user_ids = set()
+    for u in user_map.values():
+        all_user_ids.add(u.id)
+
+    # For mentors, we retrieve them from the prefetched user_ig_link_ig
+    for ig in ig_queryset:
+        if hasattr(ig, "_prefetched_objects_cache") and "user_ig_link_ig" in ig._prefetched_objects_cache:
+            links = [
+                link for link in ig.user_ig_link_ig.all()
+                if link.assignment_type == UserIgLink.AssignmentType.MENTOR and link.is_active
+            ]
+        else:
+            links = UserIgLink.objects.filter(
+                ig=ig,
+                assignment_type=UserIgLink.AssignmentType.MENTOR,
+                is_active=True,
+            ).select_related("user")
+        
+        for link in links:
+            all_user_ids.add(link.user_id)
+
+    # 4. Batch-fetch socials and mentor profiles for all these users
+    socials_map = {}
+    mentor_profiles_map = {}
+    if all_user_ids:
+        socials_qs = Socials.objects.filter(user_id__in=all_user_ids).values(
+            "user_id", "github", "facebook", "instagram", "linkedin",
+            "dribble", "behance", "stackoverflow", "medium", "hackerrank"
+        )
+        socials_map = {s["user_id"]: s for s in socials_qs}
+
+        mentor_profiles = UserMentor.objects.filter(user_id__in=all_user_ids)
+        mentor_profiles_map = {m.user_id: m for m in mentor_profiles}
+
+    return {
+        "user_map": user_map,
+        "socials_map": socials_map,
+        "mentor_profiles_map": mentor_profiles_map,
+        "mentor_socials_map": socials_map,
+    }
+
+
 class InterestGroupListApi(APIView):
     @method_decorator(cache_page(60 * 10))
     @extend_schema(
         tags=['Dashboard - Ig'],
         description="Retrieve Interest Group List Api.",
+        responses={200: InterestGroupSerializer},
+    )
+    def get(self, request):
+        from utils.types import InterestGroupStatus
+        ig = list(
+            InterestGroup.objects.filter(status=InterestGroupStatus.ACTIVE.value)
+            .select_related("created_by", "updated_by")
+            .prefetch_related("user_ig_link_ig__user")
+            .annotate(members=Count("user_ig_link_ig"))
+        )
+
+        context = get_ig_list_context(ig)
+        serializer = InterestGroupSerializer(ig, many=True, context=context)
+
+        return CustomResponse(
+            response={"interestGroup": serializer.data}
+        ).get_success_response()
+
+
+class PublicInterestGroupListApi(APIView):
+    @method_decorator(cache_page(60 * 10))
+    @extend_schema(
+        tags=['Dashboard - Ig'],
+        description="Retrieve Public Interest Group List Api.",
         responses={200: PublicInterestGroupSerializer},
     )
     def get(self, request):
@@ -1048,11 +1214,11 @@ class InterestGroupListApi(APIView):
         from django.db.models import Prefetch
         from db.impact_project import ImpactProject, ImpactProjectUserLink
 
-        ig = (
+        ig = list(
             InterestGroup.objects.filter(status=InterestGroupStatus.ACTIVE.value)
             .select_related("created_by", "updated_by")
             .prefetch_related(
-                "user_ig_link_ig",
+                "user_ig_link_ig__user",
                 Prefetch(
                     "impact_project_ig",
                     queryset=ImpactProject.objects.select_related("created_by", "updated_by").prefetch_related(
@@ -1067,7 +1233,8 @@ class InterestGroupListApi(APIView):
             .annotate(members=Count("user_ig_link_ig"))
         )
 
-        serializer = PublicInterestGroupSerializer(ig, many=True)
+        context = get_ig_list_context(ig)
+        serializer = PublicInterestGroupSerializer(ig, many=True, context=context)
 
         return CustomResponse(
             response={"interestGroups": serializer.data}

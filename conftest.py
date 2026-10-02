@@ -33,4 +33,3 @@ def django_db_setup(django_db_blocker):
                     cursor.execute(sql)
 
 
-

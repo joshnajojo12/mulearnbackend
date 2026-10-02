@@ -154,7 +154,13 @@ DATABASES = {
         "PASSWORD": decouple_config("DATABASE_PASSWORD"),
         "HOST": decouple_config("DATABASE_HOST"),
         "PORT": decouple_config("DATABASE_PORT"),
-        "CONN_MAX_AGE": 600,
+        # Must stay 0 under ASGI. Django's ASGIHandler wraps every request in a
+        # ThreadSensitiveContext, so asgiref gives each request its own thread,
+        # and DB connections are thread-local. A non-zero CONN_MAX_AGE tells
+        # close_old_connections() to keep the connection "for reuse" by a thread
+        # that is about to be destroyed, so it leaks until GC finalises it.
+        # With unbounded request concurrency that exhausts max_connections.
+        "CONN_MAX_AGE": 0,
     }
 }
 
@@ -304,6 +310,21 @@ QSEVERSE_BASE_URL = decouple_config("QSEVERSE_BASE_URL")
 QSEVERSE_API_KEY = decouple_config("QSEVERSE_API_KEY")
 
 BACKEND_API_KEY = decouple_config("BACKEND_API_KEY")
+
+# ── Notification dispatch ──────────────────────────────────────────────────
+# 'inline' (default): NotificationService writes synchronously, same as
+# every other write path today. 'celery' is a reserved value for a future
+# async dispatch task — not implemented yet, since Celery isn't reliably
+# running in this deployment; dispatch() falls back to inline if it's set.
+NOTIFICATION_DISPATCH_MODE = decouple_config("NOTIFICATION_DISPATCH_MODE", default="inline")
+
+# Audience size at/above which dispatch() writes a single broadcast_notification
+# row instead of one notification row per recipient (the hybrid fan-out branch —
+# see notification_docs/notification-system-status.md).
+NOTIFICATION_BROADCAST_THRESHOLD = decouple_config("NOTIFICATION_BROADCAST_THRESHOLD", default=500, cast=int)
+
+# TTL for the cached unread notification count (seconds).
+NOTIFICATION_UNREAD_COUNT_CACHE_TTL = decouple_config("NOTIFICATION_UNREAD_COUNT_CACHE_TTL", default=60, cast=int)
 
 DEFAULT_FILE_STORAGE = "django.core.files.storage.FileSystemStorage"
 

@@ -2,8 +2,11 @@
 Shared serializers for the Events system.
 All view modules import from this file.
 """
+import re
 import uuid
+from urllib.parse import urlparse
 
+from django.utils import timezone
 from django.utils.text import slugify
 from rest_framework import serializers
 
@@ -438,9 +441,81 @@ class EventDetailSerializer(serializers.ModelSerializer):
         return None
 
 
+class PublicEventDetailSerializer(EventDetailSerializer):
+    """
+    Detail serializer for fully anonymous callers (GET /api/v1/public/events/<id>/).
+
+    Drops ``created_by``/``updated_by``/``co_owners`` from EventDetailSerializer —
+    those expose internal user PII (id, full_name, muid, profile_pic) that has
+    always required a valid JWT to reach via the dashboard EventDetailAPI.
+    """
+
+    class Meta(EventDetailSerializer.Meta):
+        fields = [
+            f for f in EventDetailSerializer.Meta.fields
+            if f not in ('created_by', 'updated_by', 'co_owners')
+        ]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if not data.get('viewer_can_access_registration'):
+            data['registration_url'] = None
+            if isinstance(data.get('venue'), dict):
+                data['venue']['venue_online_link'] = None
+        return data
+
+
 # ─────────────────────────────────────────────────────────────
 # EVENT WRITE  (create / update input)
 # ─────────────────────────────────────────────────────────────
+
+# http(s) only, followed by the '//' of a hierarchical URL. The '//' matters:
+# without it 'localhost:3000/x' would read as scheme 'localhost' and be waved
+# through as complete when it is not. Restricted to http/https rather than
+# any RFC 3986 scheme -- these values get rendered back as clickable links,
+# so accepting e.g. 'javascript://' would let a stored value execute script
+# in a client that renders it as an href.
+_URL_SCHEME_RE = re.compile(r'^https?://', re.IGNORECASE)
+
+
+def _require_full_url(value, example):
+    """Reject a link that is missing its scheme.
+
+    'mulearn.org/register' is the common slip: it stores fine, then renders
+    as a path relative to whatever page shows it, so the link is silently
+    dead. The value is returned untouched — the message says what to fix
+    rather than rewriting what someone typed.
+    """
+    if not value:
+        return value
+
+    candidate = value.strip()
+    if not _URL_SCHEME_RE.match(candidate) or not urlparse(candidate).netloc:
+        raise serializers.ValidationError(
+            f'Enter a full link starting with https:// (e.g. {example}).'
+        )
+    return value
+
+
+# Any RFC 3986 scheme prefix, not just http(s) -- used only to tell "no scheme
+# at all" apart from "an actual (possibly unsafe) scheme" below.
+_ANY_SCHEME_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9+.-]*://')
+
+
+def _is_grandfatherable(value):
+    """Whether an unchanged stored value may skip re-validation.
+
+    Only a legacy value with *no* scheme at all (e.g. 'mulearn.org/register',
+    saved before this field was validated) is exempt -- it's inert, just a
+    dead link. A value that carries an actual non-http(s) scheme (e.g. a
+    stored 'javascript://...') must never be grandfathered: leaving it alone
+    because it "didn't change" is exactly how a stored-XSS link would survive
+    every future edit indefinitely.
+    """
+    if not value:
+        return True
+    return not _ANY_SCHEME_RE.match(value.strip())
+
 
 class EventWriteSerializer(serializers.ModelSerializer):
     """Input serializer for POST /manage/ and PUT/PATCH /manage/<id>/."""
@@ -487,23 +562,29 @@ class EventWriteSerializer(serializers.ModelSerializer):
             'event_type': {'required': False},
         }
 
+    def validate_registration_url(self, value):
+        # A full PUT (or a PATCH that resends the whole form) re-submits
+        # fields the user never touched. Grandfather in a value that's
+        # unchanged from what's already stored, so pre-existing bad data
+        # doesn't block an edit to something unrelated -- only a value the
+        # user is actually setting gets held to the stricter format. See
+        # _is_grandfatherable: this never applies to a stored unsafe scheme.
+        if self.instance and value == self.instance.registration_url and _is_grandfatherable(value):
+            return value
+        return _require_full_url(value, 'https://mulearn.org/register')
+
+    def validate_venue_online_link(self, value):
+        if self.instance and value == self.instance.venue_online_link and _is_grandfatherable(value):
+            return value
+        return _require_full_url(value, 'https://meet.google.com/abc-defg-hij')
+
     def validate_venue_maps_url(self, value):
         """Ensure venue_maps_url is a valid Google Maps URL when provided."""
-        import re
-        from urllib.parse import urlparse
-
         if not value:
             return value
 
-        # Basic URL structure check
-        try:
-            parsed = urlparse(value)
-            if not parsed.scheme or not parsed.netloc:
-                raise serializers.ValidationError(
-                    'Enter a valid URL (e.g. https://maps.google.com/...).'
-                )
-        except Exception:
-            raise serializers.ValidationError('Enter a valid URL.')
+        _require_full_url(value, 'https://maps.google.com/...')
+        parsed = urlparse(value.strip())
 
         # Only accept recognised Google Maps hostnames
         # Allowed patterns:
@@ -713,23 +794,38 @@ def get_live_events():
     return Event.objects.filter(deleted_at__isnull=True)
 
 
+def get_active_events():
+    """
+    Non-deleted events that are published/ongoing AND haven't ended yet.
+
+    Use this — not get_live_events() plus a hand-written status/end_datetime
+    filter — for any "browse events" feed. The daily status-transition cron
+    (mu_celery/event_cron.py) only flips ONGOING -> COMPLETED once a day, so
+    `status` alone can lag up to ~24h behind an event's real end time; every
+    feed that should never show an ended event needs the live end_datetime
+    check too, not just the status filter.
+    """
+    return get_live_events().filter(
+        status__in=[Event.Status.PUBLISHED, Event.Status.ONGOING],
+        end_datetime__gte=timezone.now(),
+    )
+
+
 def can_manage_event(user_id, event):
     """True if user is creator OR co-owner of this event, OR if it's a company event they belong to."""
     if event.created_by_id == user_id:
         return True
         
     if event.organiser_type == Event.OrganiserType.COMPANY.value and event.organiser_org_id:
-        from db.organization import Organization
         from db.company import Company
         from db.user import MentorScopeGrant
         from api.dashboard.mentor.dash_mentor_helper import has_scope
+        from api.dashboard.company.company_views import is_company_owner_or_admin
 
-        # Check if user is company creator for this org
-        org = Organization.objects.filter(id=event.organiser_org_id).first()
-        if org:
-            company = Company.objects.filter(name=org.title, company_user_id=user_id, status="verified").first()
-            if company:
-                return True
+        # Check if user is the company owner or an accepted co-admin for this org
+        company = Company.objects.filter(org_id=event.organiser_org_id, status="verified").first()
+        if is_company_owner_or_admin(user_id, company):
+            return True
 
         # Check if user holds an active COMPANY_MENTOR grant for this org
         if has_scope(user_id, MentorScopeGrant.ScopeType.COMPANY_MENTOR, event.organiser_org_id):

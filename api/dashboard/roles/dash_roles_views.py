@@ -178,20 +178,18 @@ class UserRoleSearchAPI(APIView):
             paginated_queryset.get("queryset"), many=True
         ).data
 
-        return CustomResponse(
-            response={
-                "data": serialized_data,
-                "pagination": paginated_queryset.get("pagination"),
-            }
-        ).get_success_response()
+        return CustomResponse().paginated_response(
+            data=serialized_data,
+            pagination=paginated_queryset.get("pagination"),
+        )
 
 
 class UserRoleLinkManagement(APIView):
     authentication_classes = [CustomizePermission]
     """
     This API is creates an interface to help manage the user and role link
-    by providing support for 
-    - Listing all users with the given role (max 10 users)
+    by providing support for
+    - Listing all users with the given role (paginated)
     - Giving a lot of users a specific role
     """
 
@@ -206,12 +204,21 @@ class UserRoleLinkManagement(APIView):
         Lists all the users with a given role
         """
         users = User.objects.filter(user_role_link_user__role__pk=role_id).distinct()
-        users = self.filter_users(request, users)
+
+        paginated_queryset = CommonUtils.get_paginated_queryset(
+            users,
+            request,
+            ["muid", "full_name"],
+            {"muid": "muid", "full_name": "full_name"},
+        )
 
         serialized_users = dash_roles_serializer.UserRoleLinkManagementSerializer(
-            users, many=True
+            paginated_queryset.get("queryset"), many=True
         )
-        return CustomResponse(response=serialized_users.data).get_success_response()
+        return CustomResponse().paginated_response(
+            data=serialized_users.data,
+            pagination=paginated_queryset.get("pagination"),
+        )
 
     @role_required([RoleType.ADMIN.value])
     @extend_schema(
@@ -227,12 +234,21 @@ class UserRoleLinkManagement(APIView):
         users = User.objects.filter(
             ~Q(user_role_link_user__role__pk=role_id)
         ).distinct()
-        users = self.filter_users(request, users)   
+
+        paginated_queryset = CommonUtils.get_paginated_queryset(
+            users,
+            request,
+            ["muid", "full_name"],
+            {"muid": "muid", "full_name": "full_name"},
+        )
 
         serialized_users = dash_roles_serializer.UserRoleLinkManagementSerializer(
-            users, many=True
+            paginated_queryset.get("queryset"), many=True
         )
-        return CustomResponse(response=serialized_users.data).get_success_response()
+        return CustomResponse().paginated_response(
+            data=serialized_users.data,
+            pagination=paginated_queryset.get("pagination"),
+        )
 
     @role_required([RoleType.ADMIN.value])
     @extend_schema(
@@ -307,24 +323,6 @@ class UserRoleLinkManagement(APIView):
             ).get_success_response()
         except Role.DoesNotExist as e:
             return CustomResponse(general_message=str(e)).get_failure_response()
-
-    def filter_users(self, request, users):
-        """
-        Filter users based on search parameters.
-
-        Args:
-            request: The HTTP request object.
-            users: The queryset of users to be filtered.
-
-        Returns:
-            QuerySet: The filtered queryset of users.
-        """
-        if search_param := request.query_params.get("search", None):
-            users = users.filter(
-                Q(muid__icontains=search_param) | Q(full_name__icontains=search_param)
-            )
-        return users[:10]
-
 
 
 class UserRole(APIView):
@@ -401,31 +399,34 @@ class UserRole(APIView):
 
             # ── Mentor cleanup ──────────────────────────────────────────────
             if role_title == RoleType.MENTOR.value:
-                from db.user import UserMentor
-                from db.task import UserIgLink
-                mentor_records = UserMentor.objects.filter(
-                    user=user, status=UserMentor.Status.APPROVED
+                from db.user import MentorApplication, MentorScopeGrant
+
+                applications = MentorApplication.objects.filter(
+                    user=user, status=MentorApplication.Status.APPROVED
                 )
-                for record in mentor_records:
-                    record.status        = UserMentor.Status.REJECTED
-                    record.updated_by_id = admin_id
-                    record.updated_at    = now
-                    record.save(update_fields=["status", "updated_by_id", "updated_at"])
+                for app in applications:
+                    app.status = MentorApplication.Status.REJECTED
+                    app.updated_by_id = admin_id
+                    app.updated_at = now
+                    app.save(update_fields=["status", "updated_by_id", "updated_at"])
 
-                    if record.mentor_tier == UserMentor.MentorTier.IG_MENTOR:
-                        UserIgLink.objects.filter(
-                            user=user,
-                            assignment_type=UserIgLink.AssignmentType.MENTOR,
-                        ).update(is_active=False)
+                    if app.mentor_tier == MentorApplication.MentorTier.IG_MENTOR and app.preferred_ig_ids:
+                        # Only release IGs no OTHER still-APPROVED application
+                        # (e.g. a separate COMPANY_MENTOR app listing the same
+                        # IG) still relies on.
+                        from api.dashboard.mentor.dash_mentor_helper import release_mentor_ig_links
+                        release_mentor_ig_links(
+                            user, app.preferred_ig_ids,
+                            exclude_application_id=app.id, actor_user_id=admin_id,
+                        )
 
-                    if record.mentor_tier in (
-                        UserMentor.MentorTier.CAMPUS_MENTOR,
-                        UserMentor.MentorTier.COMPANY_MENTOR,
-                    ) and record.org:
-                        from db.organization import UserOrganizationLink
-                        UserOrganizationLink.objects.filter(
-                            user=user, org=record.org
-                        ).update(verified=False)
+                    MentorScopeGrant.objects.filter(
+                        application=app, is_active=True
+                    ).update(
+                        is_active=False,
+                        revoked_by_id=admin_id,
+                        revoked_at=now,
+                    )
 
             # ── Intern cleanup ──────────────────────────────────────────────
             elif role_title == RoleType.INTERN.value:
@@ -439,9 +440,15 @@ class UserRole(APIView):
             # ── Company cleanup ──────────────────────────────────────────────
             elif role_title == RoleType.COMPANY.value:
                 from db.company import Company
-                Company.objects.filter(
-                    company_user_id=user.id, status="verified"
-                ).update(status="suspended")
+                from api.dashboard.company.company_views import _deactivate_company
+                # Reuse the same deactivation path as the dedicated company
+                # deactivation endpoints (PRD §4.2/§4.3) rather than a separate
+                # ad hoc "suspended" status, so admin-link revocation, status
+                # gating, and admin summary counts all stay consistent
+                # regardless of which surface triggered it.
+                company = Company.objects.filter(company_user_id=user.id, status="verified").first()
+                if company:
+                    _deactivate_company(company, admin_id)
 
         DiscordWebhooks.general_updates(
             WebHookCategory.USER_ROLE.value,

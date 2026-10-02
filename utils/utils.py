@@ -23,6 +23,12 @@ import string, random
 from django.utils.timezone import now
 from PIL import Image
 
+# Upper bound for the client-supplied `perPage` query parameter. Applies to
+# every paginated endpoint; callers that genuinely need the full set pass
+# is_pagination=False and are unaffected.
+MAX_PAGE_SIZE = 1000
+
+
 def check_alumni_status(graduation_year):
     """
     Returns True if graduation_year is a valid 4-digit year and is in the past.
@@ -68,6 +74,11 @@ class CommonUtils:
             per_page = int(request.query_params.get("perPage", 10))
         except ValueError:
             per_page = 10
+
+        # Without a ceiling, ?perPage=999999 turns any paginated endpoint into a
+        # single-request denial of service. The largest value the frontend sends
+        # is 1000; bulk exports bypass pagination entirely via is_pagination=False.
+        per_page = max(1, min(per_page, MAX_PAGE_SIZE))
         search_query = request.query_params.get("search")
         sort_by = request.query_params.get("sortBy")
 
@@ -78,13 +89,30 @@ class CommonUtils:
 
             queryset = queryset.filter(query)
 
+        # "pk" tiebreak: the requested field alone is rarely unique (e.g. many
+        # rows share a start_datetime or a status), so without it, rows tied
+        # on sort_field_name can be returned in a different relative order
+        # between requests, causing offset-paginated clients to skip or see
+        # duplicate rows across pages. Skipped for .values()/.values_list()
+        # querysets (queryset._fields is not None): ordering by a field not
+        # already in the values()/annotate() selection folds that field into
+        # GROUP BY, silently corrupting any aggregate() computed there.
+        is_grouped = queryset._fields is not None
         if sort_by:
             sort = sort_by[1:] if sort_by.startswith("-") else sort_by
             if sort_field_name := sort_fields.get(sort):
                 if sort_by.startswith("-"):
                     sort_field_name = f"-{sort_field_name}"
 
-                queryset = queryset.order_by(sort_field_name)
+                order_fields = (sort_field_name,) if is_grouped else (sort_field_name, "pk")
+                queryset = queryset.order_by(*order_fields)
+        elif is_pagination and not is_grouped and not queryset.ordered:
+            # Paginator does LIMIT/OFFSET, which MySQL does not guarantee a
+            # stable row order for across separate requests without an
+            # explicit order_by — same failure mode as above, but for the
+            # (more common) case where the caller passed no ?sortBy= at all
+            # and the queryset has no ordering of its own to fall back on.
+            queryset = queryset.order_by("pk")
         if is_pagination:
             paginator = Paginator(queryset, per_page)
             try:
@@ -465,3 +493,10 @@ def generate_code(char_count=6):
     characters = string.ascii_uppercase + string.digits
     code = "".join(random.choices(characters, k=char_count))
     return code
+
+def get_user_mentor_profile(user_id):
+    """
+    Helper to fetch a user's UserMentor profile.
+    """
+    from db.user import UserMentor
+    return UserMentor.objects.filter(user_id=user_id).first()
